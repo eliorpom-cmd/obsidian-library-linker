@@ -63,7 +63,7 @@ describe('AutoBibleQuoteInserter', () => {
 
     createInserter().scheduleForCreatedLink(editor, JOHN_3_16, link, 0);
 
-    await vi.waitFor(() => expect(editor.getContent()).toBe(`${link.trim()}\n> ${QUOTE}`));
+    await vi.waitFor(() => expect(editor.getContent()).toBe(`${link.trim()}\n> ${QUOTE}\n`));
   });
 
   test('does nothing when the setting is off', async () => {
@@ -97,7 +97,7 @@ describe('AutoBibleQuoteInserter', () => {
     inserter.scheduleForCreatedLink(editor, JOHN_3_16, link, 0);
     inserter.scheduleForCreatedLink(editor, JOHN_3_16, link, 0);
 
-    await vi.waitFor(() => expect(editor.getContent()).toBe(`${link.trim()}\n> ${QUOTE}`));
+    await vi.waitFor(() => expect(editor.getContent()).toBe(`${link.trim()}\n> ${QUOTE}\n`));
     expect(getCitation).toHaveBeenCalledTimes(1);
   });
 
