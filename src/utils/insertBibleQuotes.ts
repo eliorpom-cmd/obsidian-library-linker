@@ -1,7 +1,12 @@
 import { Editor, EditorPosition } from 'obsidian';
 import { convertBibleTextToMarkdownLink } from '@/utils/convertBibleTextToMarkdownLink';
 import { formatBibleText } from '@/utils/formatBibleText';
-import type { BibleCitationProvider, BibleReference, LinkReplacerSettings } from '@/types';
+import type {
+  BibleCitationProvider,
+  BibleReference,
+  LinkReplacerSettings,
+  LinkStyles,
+} from '@/types';
 import {
   findJWLibraryLinks,
   findJWLibraryLinksInLine,
@@ -17,13 +22,24 @@ const MARKDOWN_LINK_WITH_JWLIBRARY =
   /\[[^\]]*\]\(jwlibrary:\/\/\/finder\?bible=\d{8}(?:-\d{8})?(?:&[^)]*?)?\)/g;
 const BARE_JWLIBRARY_LINK = /jwlibrary:\/\/\/finder\?bible=\d{8}(?:-\d{8})?(?:&[^\s)]*)?/g;
 
-function isLinkStandaloneOnLine(lineText: string): boolean {
-  const stripped = lineText
+type LinkDecorations = Pick<LinkStyles, 'prefixOutsideLink' | 'suffixOutsideLink'>;
+
+function isLinkStandaloneOnLine(lineText: string, decorations?: LinkDecorations): boolean {
+  let stripped = lineText
     .replace(MARKDOWN_LINK_WITH_JWLIBRARY, '')
     .replace(BARE_JWLIBRARY_LINK, '')
     // A multi-range reference is written as several links joined by commas,
     // which still makes the line nothing but the reference.
     .replace(/[,;]/g, '');
+
+  // The characters configured around the link — brackets, an emoji — belong to
+  // the reference, not to any surrounding text.
+  for (const decoration of [decorations?.prefixOutsideLink, decorations?.suffixOutsideLink]) {
+    if (decoration?.trim()) {
+      stripped = stripped.split(decoration).join('');
+    }
+  }
+
   return stripped.trim().length === 0;
 }
 
@@ -193,7 +209,7 @@ export async function insertAllBibleQuotes(
     try {
       const quoteText = await generateBibleQuoteText(linkInfo.reference, settings, provider);
       if (quoteText) {
-        if (isLinkStandaloneOnLine(currentLine)) {
+        if (isLinkStandaloneOnLine(currentLine, settings)) {
           changes.push({
             from: { line: linkInfo.lineNumber, ch: 0 },
             to: { line: linkInfo.lineNumber, ch: currentLine.length },
@@ -299,7 +315,7 @@ export async function insertBibleQuoteAtCursor(
 
   if (quoteTexts.length > 0) {
     const combinedText = quoteTexts.join('\n\n');
-    if (isLinkStandaloneOnLine(targetLineText)) {
+    if (isLinkStandaloneOnLine(targetLineText, settings)) {
       editor.transaction({
         changes: [
           {
@@ -390,6 +406,16 @@ function hasQuoteBelow(editor: Editor, line: number): boolean {
  * link is looked up again in case it moved, and the cursor is put back where
  * the user left it.
  */
+/**
+ * Opens a collapsed callout (`[!quote]-` becomes `[!quote]+`).
+ *
+ * A quote that appears on its own but shows nothing is pointless, and `+`
+ * keeps the callout foldable, so it can still be closed by hand.
+ */
+function openCollapsedCallout(quoteText: string): string {
+  return quoteText.replace(/^(\s*>\s*\[![^\]]+\])-/, '$1+');
+}
+
 export async function insertBibleQuoteForCreatedLink(
   editor: Editor,
   reference: BibleReference,
@@ -397,7 +423,8 @@ export async function insertBibleQuoteForCreatedLink(
   provider: BibleCitationProvider,
   anchor: CreatedLinkAnchor,
 ): Promise<CreatedLinkQuoteResult> {
-  const quoteText = await generateBibleQuoteText(reference, settings, provider);
+  const generated = await generateBibleQuoteText(reference, settings, provider);
+  const quoteText = generated && openCollapsedCallout(generated);
 
   if (!quoteText) {
     return { inserted: false, alreadyExists: false, fetchFailed: true, anchorLost: false };
@@ -419,35 +446,68 @@ export async function insertBibleQuoteForCreatedLink(
   }
 
   const targetLineText = editor.getLine(targetLine);
-  const cursor = editor.getCursor();
+  const cursorBefore = editor.getCursor();
+  const standalone = isLinkStandaloneOnLine(targetLineText, settings);
+
+  // When the quote replaces the reference the user is done with that line, so
+  // make sure there is a line left to keep writing on.
+  const quoteEndsNote = targetLine >= editor.lastLine();
+  const insertedText =
+    (standalone ? '' : '\n\n') + quoteText + (standalone && quoteEndsNote ? '\n' : '');
 
   editor.transaction({
     changes: [
-      isLinkStandaloneOnLine(targetLineText)
-        ? {
-            from: { line: targetLine, ch: 0 },
-            to: { line: targetLine, ch: targetLineText.length },
-            text: quoteText,
-          }
-        : {
-            from: { line: targetLine, ch: targetLineText.length },
-            to: { line: targetLine, ch: targetLineText.length },
-            text: '\n\n' + quoteText,
-          },
+      {
+        from: { line: targetLine, ch: standalone ? 0 : targetLineText.length },
+        to: { line: targetLine, ch: targetLineText.length },
+        text: insertedText,
+      },
     ],
   });
 
-  restoreCursor(editor, cursor);
+  const insertedLineBreaks = insertedText.split('\n').length - 1;
+
+  if (standalone && cursorBefore.line === targetLine) {
+    // The reference became the quote — carry on below it.
+    placeCursorAfterQuote(editor, targetLine, insertedLineBreaks, quoteEndsNote);
+  } else {
+    // The reference sits in a sentence the user may still be writing.
+    restoreCursor(editor, cursorBefore, targetLine, insertedLineBreaks);
+  }
 
   return { inserted: true, alreadyExists: false, fetchFailed: false, anchorLost: false };
 }
 
 /**
- * Puts the cursor back after an insertion the user did not ask for, clamped in
- * case the line it sat on was rewritten.
+ * Leaves the cursor on the line following the quote, so the user can keep
+ * writing where the reference used to be.
  */
-function restoreCursor(editor: Editor, cursor: EditorPosition): void {
-  const line = Math.min(Math.max(cursor.line, 0), editor.lastLine());
+function placeCursorAfterQuote(
+  editor: Editor,
+  targetLine: number,
+  insertedLineBreaks: number,
+  quoteEndsNote: boolean,
+): void {
+  // With a trailing newline the last inserted line is the empty one to
+  // continue on; otherwise the note already has a line after the quote.
+  const lineAfterQuote = targetLine + insertedLineBreaks + (quoteEndsNote ? 0 : 1);
+  const line = Math.min(lineAfterQuote, editor.lastLine());
+
+  editor.setCursor({ line, ch: editor.getLine(line).length });
+}
+
+/**
+ * Puts the cursor back after an insertion the user did not ask for, following
+ * the text it was sitting on if the quote pushed it further down.
+ */
+function restoreCursor(
+  editor: Editor,
+  cursor: EditorPosition,
+  targetLine: number,
+  insertedLineBreaks: number,
+): void {
+  const followed = cursor.line > targetLine ? cursor.line + insertedLineBreaks : cursor.line;
+  const line = Math.min(Math.max(followed, 0), editor.lastLine());
   const ch = Math.min(Math.max(cursor.ch, 0), editor.getLine(line).length);
 
   editor.setCursor({ line, ch });

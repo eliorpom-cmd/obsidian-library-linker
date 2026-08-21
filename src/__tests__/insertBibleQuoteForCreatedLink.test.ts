@@ -62,7 +62,7 @@ describe('insertBibleQuoteForCreatedLink', () => {
       fetchFailed: false,
       anchorLost: false,
     });
-    expect(editor.getContent()).toBe(`${link.trim()}\n> ${QUOTE}`);
+    expect(editor.getContent()).toBe(`${link.trim()}\n> ${QUOTE}\n`);
   });
 
   test('appends the quote below the line when the link sits inside a sentence', async () => {
@@ -90,7 +90,7 @@ describe('insertBibleQuoteForCreatedLink', () => {
     });
 
     expect(result.inserted).toBe(true);
-    expect(editor.getContent()).toBe(`intro\n\n${link.trim()}\n> ${QUOTE}`);
+    expect(editor.getContent()).toBe(`intro\n\n${link.trim()}\n> ${QUOTE}\n`);
   });
 
   test('writes nothing when the created link is gone', async () => {
@@ -145,7 +145,7 @@ describe('insertBibleQuoteForCreatedLink', () => {
     expect(editor.getContent()).toBe(link);
   });
 
-  test('leaves the cursor where the user left it', async () => {
+  test('leaves the cursor where the user left it when they are mid-sentence', async () => {
     const link = createdLink(JOHN_3_16);
     const line = `As we read in ${link}the good news is preached.`;
     const editor = createFakeEditor(line, { line: 0, ch: 5 });
@@ -156,6 +156,71 @@ describe('insertBibleQuoteForCreatedLink', () => {
     });
 
     expect(editor.getCursor()).toEqual({ line: 0, ch: 5 });
+  });
+
+  test('puts the cursor on a fresh line after a quote that replaced the reference', async () => {
+    const link = createdLink(JOHN_3_16);
+    const editor = createFakeEditor(`intro\n${link}`, { line: 1, ch: link.length });
+
+    await insertBibleQuoteForCreatedLink(editor, JOHN_3_16, settings, provider, {
+      line: 1,
+      linkUrl: JOHN_3_16_URL,
+    });
+
+    // intro / link / > quote / <empty, cursor here>
+    expect(editor.getContent()).toBe(`intro\n${link.trim()}\n> ${QUOTE}\n`);
+    expect(editor.getCursor()).toEqual({ line: 3, ch: 0 });
+  });
+
+  test('keeps the cursor on the text it was on, wherever that text moved to', async () => {
+    const link = createdLink(JOHN_3_16);
+    const editor = createFakeEditor(`${link}\n\nsomewhere else`, { line: 2, ch: 4 });
+
+    await insertBibleQuoteForCreatedLink(editor, JOHN_3_16, settings, provider, {
+      line: 0,
+      linkUrl: JOHN_3_16_URL,
+    });
+
+    // "somewhere else" was pushed one line down by the quote.
+    expect(editor.getCursor()).toEqual({ line: 3, ch: 4 });
+  });
+
+  test('replaces the line when the reference is wrapped in the configured decorations', async () => {
+    // The style the recording used: "(Matthew 24:14)" alone on its line.
+    settings = createSettings({
+      prefixOutsideLink: '(',
+      suffixOutsideLink: ')',
+      bibleQuote: {
+        template: BIBLE_QUOTE_TEMPLATES.foldable,
+        autoInsertOnLinkCreation: true,
+      },
+    });
+
+    const link = createdLink(JOHN_3_16);
+
+    const editor = createFakeEditor(link, { line: 0, ch: link.length });
+
+    await insertBibleQuoteForCreatedLink(editor, JOHN_3_16, settings, provider, {
+      line: 0,
+      linkUrl: JOHN_3_16_URL,
+    });
+
+    // The reference is not repeated above the quote.
+    expect(editor.getContent()).toBe(`> [!quote]+ ${link}\n> ${QUOTE}\n`);
+  });
+
+  test('opens a collapsed callout so the quote can be read straight away', async () => {
+    settings.bibleQuote.template = BIBLE_QUOTE_TEMPLATES.foldable;
+
+    const link = createdLink(JOHN_3_16);
+    const editor = createFakeEditor(link);
+
+    await insertBibleQuoteForCreatedLink(editor, JOHN_3_16, settings, provider, {
+      line: 0,
+      linkUrl: JOHN_3_16_URL,
+    });
+
+    expect(editor.getContent()).toBe(`> [!quote]+ ${link.trim()}\n> ${QUOTE}\n`);
   });
 
   test('fetches every range of a multi-range reference into one quote', async () => {
@@ -186,7 +251,7 @@ describe('insertBibleQuoteForCreatedLink', () => {
 
     expect(result.inserted).toBe(true);
     expect(getCitation).toHaveBeenCalledTimes(2);
-    expect(editor.getContent()).toBe(`${link.trim()}\n> First part. Second part.`);
+    expect(editor.getContent()).toBe(`${link.trim()}\n> First part. Second part.\n`);
   });
 
   test('fetches every chapter of a multi-chapter reference', async () => {
@@ -229,7 +294,7 @@ describe('insertBibleQuoteForCreatedLink', () => {
       { book: 40, chapter: 4, verseRanges: [{ start: 1, end: 11 }] },
       'E',
     );
-    expect(editor.getContent()).toBe(`${link.trim()}\n> Chapter three. Chapter four.`);
+    expect(editor.getContent()).toBe(`${link.trim()}\n> Chapter three. Chapter four.\n`);
   });
 
   test('writes nothing when only part of a multi-chapter reference can be fetched', async () => {
