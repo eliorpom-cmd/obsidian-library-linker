@@ -1,0 +1,65 @@
+# Fork-only release workflow.
+#
+# The upstream "Release" workflow needs a USER_TOKEN secret this fork does not
+# have, and runs on a runner label this fork cannot schedule. This one builds
+# the plugin and publishes main.js, manifest.json and styles.css as flat assets
+# with the built-in GITHUB_TOKEN, so BRAT can install straight from the release.
+#
+# Run it from the Actions tab ("Run workflow"). Drop this file before sending
+# anything upstream.
+name: Fork Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Tag to publish (defaults to the version in manifest.json)
+        required: false
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and publish
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version-file: '.nvmrc'
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v6
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build
+        run: pnpm build
+
+      - name: Resolve tag
+        id: resolve
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          TAG="${INPUT_TAG:-$(jq -r '.version' manifest.json)}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Create Release and Upload Assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.resolve.outputs.tag }}
+          name: ${{ steps.resolve.outputs.tag }}
+          body: |
+            Fork build of JW Library Linker (plugin id `jw-library-linker-fork`), installable with BRAT.
+
+            See CHANGELOG.md for what changed.
+          files: |
+            main.js
+            manifest.json
+            styles.css
