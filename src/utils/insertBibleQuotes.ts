@@ -1,7 +1,7 @@
-import { Editor } from 'obsidian';
+import { Editor, EditorPosition } from 'obsidian';
 import { convertBibleTextToMarkdownLink } from '@/utils/convertBibleTextToMarkdownLink';
 import { formatBibleText } from '@/utils/formatBibleText';
-import type { BibleCitationProvider, LinkReplacerSettings } from '@/types';
+import type { BibleCitationProvider, BibleReference, LinkReplacerSettings } from '@/types';
 import {
   findJWLibraryLinks,
   findJWLibraryLinksInLine,
@@ -9,6 +9,7 @@ import {
   type JWLibraryLinkInfo,
   type ContentSelection,
 } from '@/utils/findJWLibraryLinks';
+import { splitBibleReferenceForCitation } from '@/utils/splitBibleReferenceForCitation';
 import { logger } from '@/utils/logger';
 import { getBookLanguage } from './signLanguage';
 
@@ -19,7 +20,10 @@ const BARE_JWLIBRARY_LINK = /jwlibrary:\/\/\/finder\?bible=\d{8}(?:-\d{8})?(?:&[
 function isLinkStandaloneOnLine(lineText: string): boolean {
   const stripped = lineText
     .replace(MARKDOWN_LINK_WITH_JWLIBRARY, '')
-    .replace(BARE_JWLIBRARY_LINK, '');
+    .replace(BARE_JWLIBRARY_LINK, '')
+    // A multi-range reference is written as several links joined by commas,
+    // which still makes the line nothing but the reference.
+    .replace(/[,;]/g, '');
   return stripped.trim().length === 0;
 }
 
@@ -37,21 +41,34 @@ function processTemplate(
     .replace(/\{quote\}/g, variables.quote.trim());
 }
 
-async function generateBibleQuoteText(
-  linkInfo: JWLibraryLinkInfo,
+/**
+ * Fetches the text of a reference, one provider lookup per part.
+ *
+ * Multi-range and multi-chapter references cannot be resolved in a single
+ * lookup, so they are split up and the parts are stitched back together.
+ * A missing part fails the whole citation — a partial quote would silently
+ * misrepresent the reference.
+ */
+async function fetchCitationText(
+  reference: BibleReference,
   settings: LinkReplacerSettings,
   provider: BibleCitationProvider,
 ): Promise<string | null> {
-  try {
-    logger.log('generateBibleQuoteText: fetching text for', linkInfo.reference);
-    const result = await provider.getCitation(
-      linkInfo.reference,
-      getBookLanguage(settings.language),
-    );
+  const parts = splitBibleReferenceForCitation(reference);
+
+  if (parts.length === 0) {
+    logger.warn('fetchCitationText: reference has no verse ranges', reference);
+    return null;
+  }
+
+  const texts: string[] = [];
+
+  for (const part of parts) {
+    const result = await provider.getCitation(part, getBookLanguage(settings.language));
 
     if (!result.success || !result.text) {
       logger.warn(
-        'generateBibleQuoteText: fetch failed —',
+        'fetchCitationText: fetch failed —',
         result.error ?? 'empty text',
         'success:',
         result.success,
@@ -59,20 +76,41 @@ async function generateBibleQuoteText(
       return null;
     }
 
-    logger.log('generateBibleQuoteText: fetched text length:', result.text.length);
+    texts.push(result.text.trim());
+  }
 
-    const bibleRefLinked = convertBibleTextToMarkdownLink(linkInfo.reference, settings);
+  return texts.join(' ');
+}
+
+async function generateBibleQuoteText(
+  reference: BibleReference,
+  settings: LinkReplacerSettings,
+  provider: BibleCitationProvider,
+): Promise<string | null> {
+  try {
+    logger.log('generateBibleQuoteText: fetching text for', reference);
+    const text = await fetchCitationText(reference, settings, provider);
+
+    if (!text) {
+      return null;
+    }
+
+    logger.log('generateBibleQuoteText: fetched text length:', text.length);
+
+    // The quote is labelled with the reference the user wrote, not with the
+    // parts it was fetched in.
+    const bibleRefLinked = convertBibleTextToMarkdownLink(reference, settings);
     if (!bibleRefLinked) {
       logger.warn('generateBibleQuoteText: convertBibleTextToMarkdownLink returned falsy');
       return null;
     }
 
-    const bibleRef = formatBibleText(linkInfo.reference, settings.bookLength, settings.language);
+    const bibleRef = formatBibleText(reference, settings.bookLength, settings.language);
 
     const processed = processTemplate(settings.bibleQuote.template, {
       bibleRef,
       bibleRefLinked,
-      quote: result.text,
+      quote: text,
     });
 
     return processed;
@@ -153,7 +191,7 @@ export async function insertAllBibleQuotes(
     }
 
     try {
-      const quoteText = await generateBibleQuoteText(linkInfo, settings, provider);
+      const quoteText = await generateBibleQuoteText(linkInfo.reference, settings, provider);
       if (quoteText) {
         if (isLinkStandaloneOnLine(currentLine)) {
           changes.push({
@@ -252,14 +290,7 @@ export async function insertBibleQuoteAtCursor(
     const reference = parseJWLibraryLink(linkInfo.url);
     logger.log('reference', reference);
     if (reference) {
-      const quoteText = await generateBibleQuoteText(
-        {
-          ...linkInfo,
-          reference,
-        },
-        settings,
-        provider,
-      );
+      const quoteText = await generateBibleQuoteText(reference, settings, provider);
       if (quoteText) {
         quoteTexts.push(quoteText);
       }
@@ -293,4 +324,131 @@ export async function insertBibleQuoteAtCursor(
   }
 
   return { inserted: false, alreadyExists: false, fetchFailed: linksOnTargetLine.length > 0 };
+}
+
+/** Where a freshly created link was written, so its quote can be placed next to it. */
+export interface CreatedLinkAnchor {
+  /** Line the link was written to. */
+  line: number;
+  /** The `jwlibrary:///…` URL of the created link, used to find it again. */
+  linkUrl: string;
+}
+
+export interface CreatedLinkQuoteResult {
+  inserted: boolean;
+  alreadyExists: boolean;
+  fetchFailed: boolean;
+  /** The created link was gone by the time the text arrived — nothing was written. */
+  anchorLost: boolean;
+}
+
+/**
+ * Finds the line the created link currently lives on.
+ *
+ * The text is fetched while the user keeps typing, so the link may have moved
+ * by the time it arrives. The line it was written to is checked first, then
+ * the closest line that still contains the same URL.
+ */
+function findCreatedLinkLine(editor: Editor, anchor: CreatedLinkAnchor): number | null {
+  const lastLine = editor.lastLine();
+
+  if (
+    anchor.line >= 0 &&
+    anchor.line <= lastLine &&
+    editor.getLine(anchor.line).includes(anchor.linkUrl)
+  ) {
+    return anchor.line;
+  }
+
+  let closest: number | null = null;
+
+  for (let line = 0; line <= lastLine; line++) {
+    if (!editor.getLine(line).includes(anchor.linkUrl)) continue;
+
+    if (closest === null || Math.abs(line - anchor.line) < Math.abs(closest - anchor.line)) {
+      closest = line;
+    }
+  }
+
+  return closest;
+}
+
+function hasQuoteBelow(editor: Editor, line: number): boolean {
+  if (line >= editor.lastLine()) return false;
+
+  return editor
+    .getLine(line + 1)
+    .trim()
+    .startsWith('>');
+}
+
+/**
+ * Inserts the quote for a link that was just created by the suggester.
+ *
+ * Unlike the command driven insertions this runs while the user is typing:
+ * the text is fetched first and the editor is only touched afterwards, the
+ * link is looked up again in case it moved, and the cursor is put back where
+ * the user left it.
+ */
+export async function insertBibleQuoteForCreatedLink(
+  editor: Editor,
+  reference: BibleReference,
+  settings: LinkReplacerSettings,
+  provider: BibleCitationProvider,
+  anchor: CreatedLinkAnchor,
+): Promise<CreatedLinkQuoteResult> {
+  const quoteText = await generateBibleQuoteText(reference, settings, provider);
+
+  if (!quoteText) {
+    return { inserted: false, alreadyExists: false, fetchFailed: true, anchorLost: false };
+  }
+
+  const targetLine = findCreatedLinkLine(editor, anchor);
+
+  if (targetLine === null) {
+    logger.warn(
+      'insertBibleQuoteForCreatedLink: created link no longer found, skipping insertion',
+      anchor.linkUrl,
+    );
+    return { inserted: false, alreadyExists: false, fetchFailed: false, anchorLost: true };
+  }
+
+  if (hasQuoteBelow(editor, targetLine)) {
+    logger.log(`insertBibleQuoteForCreatedLink: line ${targetLine} is already quoted`);
+    return { inserted: false, alreadyExists: true, fetchFailed: false, anchorLost: false };
+  }
+
+  const targetLineText = editor.getLine(targetLine);
+  const cursor = editor.getCursor();
+
+  editor.transaction({
+    changes: [
+      isLinkStandaloneOnLine(targetLineText)
+        ? {
+            from: { line: targetLine, ch: 0 },
+            to: { line: targetLine, ch: targetLineText.length },
+            text: quoteText,
+          }
+        : {
+            from: { line: targetLine, ch: targetLineText.length },
+            to: { line: targetLine, ch: targetLineText.length },
+            text: '\n\n' + quoteText,
+          },
+    ],
+  });
+
+  restoreCursor(editor, cursor);
+
+  return { inserted: true, alreadyExists: false, fetchFailed: false, anchorLost: false };
+}
+
+/**
+ * Puts the cursor back after an insertion the user did not ask for, clamped in
+ * case the line it sat on was rewritten.
+ */
+function restoreCursor(editor: Editor, cursor: EditorPosition): void {
+  const line = Math.min(Math.max(cursor.line, 0), editor.lastLine());
+  const ch = Math.min(Math.max(cursor.ch, 0), editor.getLine(line).length);
+
+  editor.setCursor({ line, ch });
 }
