@@ -1,6 +1,6 @@
 {
-  "id": "jw-library-linker",
-  "name": "JW Library Linker",
+  "id": "jw-library-linker-fork",
+  "name": "JW Library Linker (Fork)",
   "version": "0.16.2",
   "minAppVersion": "1.7.2",
   "description": "Converts JW Library references to actual links in JW Library.",
