@@ -1,4 +1,4 @@
-import { beforeAll, describe, expect, it } from 'vitest';
+import { beforeAll, describe, expect, it, vi } from 'vitest';
 import type { Editor, EditorPosition } from 'obsidian';
 import { BibleReferenceSuggester } from '@/BibleReferenceSuggester';
 import type JWLibraryLinkerPlugin from '@/main';
@@ -141,6 +141,35 @@ describe('BibleReferenceSuggester.onTrigger', () => {
       expect(result?.start.ch).toBe('km/b '.length);
     });
 
+    it.each(['(', '[', '*', '**', '_', '> ', '"', '“', '«'])(
+      'is a command right after %s',
+      (before) => {
+        const result = trigger(`${before}/b John 3:16|`);
+
+        expect(result?.query).toBe('John 3:16');
+        expect(result?.start.ch).toBe(before.length);
+      },
+    );
+
+    it.each([
+      ['(/b John 3:16|)', ')'],
+      ['**/b John 3:16|**', '**'],
+      ['[/b John 3:16|]', ']'],
+    ])('leaves the closing markup of %s in the note', (line, closing) => {
+      const result = trigger(line);
+      const text = line.replace('|', '');
+
+      expect(result?.query).toBe('John 3:16');
+      expect(text.slice(result!.end.ch)).toBe(closing);
+    });
+
+    it('covers the rest of a reference edited in the middle', () => {
+      const result = trigger('/b John 3:1|6 and more');
+
+      expect(result?.query).toBe('John 3:16');
+      expect(result?.end.ch).toBe('/b John 3:16'.length);
+    });
+
     it('does not stop detecting references typed before it', () => {
       expect(trigger('John 3:16| /b Matt 5')?.query).toBe('John 3:16');
     });
@@ -153,5 +182,51 @@ describe('BibleReferenceSuggester.onTrigger', () => {
 
       expect(suggestions.map((s) => s.command)).toEqual(['typing']);
     });
+
+    it('does not log an error for each keystroke of a partial reference', () => {
+      const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+      const suggester = createSuggester();
+      const editor = {} as Editor;
+
+      for (const line of ['/b J|', '/b Jo|', '/b Joh|', '/b John 3:|']) {
+        const result = show(suggester, editor, line);
+        suggester.getSuggestions({ ...result!, editor, file: null } as never);
+      }
+
+      expect(error).not.toHaveBeenCalled();
+      error.mockRestore();
+    });
   });
+});
+
+describe('BibleReferenceSuggester.selectSuggestion', () => {
+  // Chooses the link suggestion for the command in `line`, which ends at `endCh`
+  function choose(line: string, endCh: number): string {
+    const replaceRange = vi.fn();
+    const editor = { getLine: () => line, replaceRange } as unknown as Editor;
+    const suggester = createSuggester();
+    // The default setting: a space after the link to keep typing
+    suggester.plugin.settings.suffixOutsideLink = ' ';
+    suggester.context = {
+      editor,
+      start: { line: 0, ch: line.indexOf('/b') },
+      end: { line: 0, ch: endCh },
+      query: 'John 3:16',
+      file: null,
+    } as never;
+
+    suggester.selectSuggestion({ text: 'John 3:16', command: 'link', description: '' });
+    return replaceRange.mock.calls[0][0] as string;
+  }
+
+  it('keeps the space after the link at the end of the line', () => {
+    expect(choose('/b John 3:16', '/b John 3:16'.length)).toMatch(/\) $/);
+  });
+
+  it.each(['(/b John 3:16)', '**/b John 3:16**', '/b John 3:16 and more'])(
+    'drops the space after the link before what follows in %s',
+    (line) => {
+      expect(choose(line, line.indexOf('16') + 2)).toMatch(/\)$/);
+    },
+  );
 });

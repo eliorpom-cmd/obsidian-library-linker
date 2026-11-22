@@ -10,7 +10,7 @@ import { ConfiguredBibleCitationProvider } from '@/services/ConfiguredBibleCitat
 import { BibleEpubImportService } from '@/services/BibleEpubImportService';
 import { AutoBibleQuoteInserter } from '@/services/AutoBibleQuoteInserter';
 import { createCreatedLinkTrackingExtension } from '@/services/createdLinkTrackingExtension';
-import { listQuoteEnterExtension } from '@/services/listQuoteEnterExtension';
+import { createListQuoteEnterExtension } from '@/services/listQuoteEnterExtension';
 import { CreatedLinkTracker } from '@/utils/createdLinkTracker';
 import { getOfflineBibleVaultPath } from '@/services/PluginDataPathService';
 import { BibleTextFetcher } from '@/services/BibleTextFetcher';
@@ -20,6 +20,7 @@ import { BibleReferenceSuggester } from '@/BibleReferenceSuggester';
 import { linkUnlinkedBibleReferences } from '@/utils/linkUnlinkedBibleReferences';
 import { ConvertSuggester } from '@/ConvertSuggester';
 import { insertAllBibleQuotes, insertBibleQuoteAtCursor } from '@/utils/insertBibleQuotes';
+import { MAX_QUOTE_CHAPTERS } from '@/utils/splitBibleReferenceForCitation';
 import { logger } from '@/utils/logger';
 import { getBookLanguage } from '@/utils/signLanguage';
 import { ContentSelection } from '@/utils/findJWLibraryLinks';
@@ -105,7 +106,9 @@ export default class JWLibraryLinkerPlugin extends Plugin {
     const createdLinkTracker = new CreatedLinkTracker();
     const tracking = createCreatedLinkTrackingExtension(createdLinkTracker);
     this.registerEditorExtension(tracking.extension);
-    this.registerEditorExtension(listQuoteEnterExtension);
+    this.registerEditorExtension(
+      createListQuoteEnterExtension(() => this.settings.bibleQuote.autoInsertOnLinkCreation),
+    );
 
     this.autoBibleQuoteInserter = new AutoBibleQuoteInserter(
       () => this.settings,
@@ -214,6 +217,9 @@ export default class JWLibraryLinkerPlugin extends Plugin {
             this.bibleCitationProvider,
             contentSelection,
           );
+          if (result.tooManyChapters > 0) {
+            new Notice(this.tooManyChaptersNotice());
+          }
           if (result.inserted > 0) {
             const notice = contentSelection
               ? this.t('notices.bibleQuotesInsertedSelection')
@@ -221,7 +227,7 @@ export default class JWLibraryLinkerPlugin extends Plugin {
             new Notice(notice);
           } else if (result.fetchFailed > 0) {
             new Notice(this.t('notices.bibleQuoteFetchFailed'));
-          } else {
+          } else if (result.tooManyChapters === 0) {
             new Notice(this.t('notices.noBibleLinksFound'));
           }
         } catch (error: unknown) {
@@ -245,13 +251,16 @@ export default class JWLibraryLinkerPlugin extends Plugin {
             this.settings,
             this.bibleCitationProvider,
           );
+          if (result.tooManyChapters) {
+            new Notice(this.tooManyChaptersNotice());
+          }
           if (result.inserted) {
             new Notice(this.t('notices.bibleQuoteInsertedAtCursor'));
           } else if (result.alreadyExists) {
             new Notice(this.t('notices.bibleQuoteAlreadyExists'));
           } else if (result.fetchFailed) {
             new Notice(this.t('notices.bibleQuoteFetchFailed'));
-          } else {
+          } else if (!result.tooManyChapters) {
             new Notice(this.t('notices.noBibleLinkAtCursor'));
           }
         } catch (error: unknown) {
@@ -287,13 +296,16 @@ export default class JWLibraryLinkerPlugin extends Plugin {
                     this.settings,
                     this.bibleCitationProvider,
                   );
+                  if (result.tooManyChapters) {
+                    new Notice(this.tooManyChaptersNotice());
+                  }
                   if (result.inserted) {
                     new Notice(this.t('notices.bibleQuoteInsertedAtCursor'));
                   } else if (result.alreadyExists) {
                     new Notice(this.t('notices.bibleQuoteAlreadyExists'));
                   } else if (result.fetchFailed) {
                     new Notice(this.t('notices.bibleQuoteFetchFailed'));
-                  } else {
+                  } else if (!result.tooManyChapters) {
                     new Notice(this.t('notices.noBibleLinkAtCursor'));
                   }
                 } catch (error: unknown) {
@@ -310,6 +322,10 @@ export default class JWLibraryLinkerPlugin extends Plugin {
     );
 
     logger.log('Plugin loaded');
+  }
+
+  private tooManyChaptersNotice(): string {
+    return this.t('notices.bibleQuoteTooManyChapters', { max: String(MAX_QUOTE_CHAPTERS) });
   }
 
   /**

@@ -1,5 +1,10 @@
 import { Notice, type Editor, type EditorPosition } from 'obsidian';
-import type { BibleCitationProvider, BibleReference, LinkReplacerSettings } from '@/types';
+import type {
+  BibleCitationProvider,
+  BibleReference,
+  Language,
+  LinkReplacerSettings,
+} from '@/types';
 import { findJWLibraryLinksInLine } from '@/utils/findJWLibraryLinks';
 import {
   insertBibleQuoteForCreatedLink,
@@ -8,6 +13,11 @@ import {
   type CreatedLinkQuoteResult,
 } from '@/utils/insertBibleQuotes';
 import { logger } from '@/utils/logger';
+import { getBookLanguage } from '@/utils/signLanguage';
+import {
+  exceedsQuoteChapterLimit,
+  MAX_QUOTE_CHAPTERS,
+} from '@/utils/splitBibleReferenceForCitation';
 import type { CreatedLinkTracker, TrackedRange } from '@/utils/createdLinkTracker';
 
 type TranslateFn = (key: string, variables?: Record<string, string>) => string;
@@ -40,6 +50,14 @@ export class AutoBibleQuoteInserter {
   /** Set on plugin unload: lookups still pending must not touch any note. */
   private disposed = false;
 
+  /**
+   * Whether the failure notice was shown while no Bible text is available at
+   * all (offline only, with no Bible imported): every created link would fail
+   * the same way, so it is shown once per session and language, until text
+   * becomes available for that language again.
+   */
+  private readonly unavailableNoticeShown = new Set<Language>();
+
   constructor(
     private readonly getSettings: () => LinkReplacerSettings,
     private readonly provider: BibleCitationProvider,
@@ -64,6 +82,14 @@ export class AutoBibleQuoteInserter {
     at: EditorPosition,
   ): void {
     if (!this.getSettings().bibleQuote.autoInsertOnLinkCreation) return;
+
+    // A whole-chapter link (`John 3`) names no verses to quote.
+    if (!reference.verseRanges?.length) return;
+
+    if (exceedsQuoteChapterLimit(reference)) {
+      new Notice(this.t('notices.bibleQuoteTooManyChapters', { max: String(MAX_QUOTE_CHAPTERS) }));
+      return;
+    }
 
     const { line } = at;
     // A multi-range reference produces several links; the first one anchors
@@ -162,6 +188,20 @@ export class AutoBibleQuoteInserter {
     return !this.disposed && this.getSettings().bibleQuote.autoInsertOnLinkCreation;
   }
 
+  private async notifyFetchFailed(): Promise<void> {
+    const language = getBookLanguage(this.getSettings().language);
+    const available = await this.provider.isLanguageAvailable(language).catch(() => true);
+
+    if (available) {
+      this.unavailableNoticeShown.delete(language);
+    } else {
+      if (this.unavailableNoticeShown.has(language)) return;
+      this.unavailableNoticeShown.add(language);
+    }
+
+    new Notice(this.t('notices.bibleQuoteFetchFailed'));
+  }
+
   /**
    * Awaitable counterpart of {@link scheduleForCreatedLink}. Never rejects —
    * failures surface as a notice, unless the insertion is no longer wanted.
@@ -185,7 +225,7 @@ export class AutoBibleQuoteInserter {
       );
 
       if (result.fetchFailed && this.isActive()) {
-        new Notice(this.t('notices.bibleQuoteFetchFailed'));
+        await this.notifyFetchFailed();
       }
 
       return result;

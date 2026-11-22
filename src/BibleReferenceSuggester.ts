@@ -16,11 +16,19 @@ import { buildBookNameRegex } from '@/utils/buildBookNameRegex';
 import { logger } from '@/utils/logger';
 
 const TRIGGER = '/b ';
+/** Characters that continue a reference after the cursor: "6" in "John 3:1|6". */
+const REFERENCE_CONTINUATION = /^[\p{L}\p{N}:.,\-–]*/u;
+/** A character after which the link needs no trailing space. */
+const CLOSING_OR_SPACE = /^[\s)\]}*_"'”’»]$/;
+/** What may come right before a command: a space, or opening punctuation or markup. */
+const BEFORE_COMMAND = /[\s([{*_>"'“‘«]/;
 
 /**
  * Where the `/b` command the cursor is in starts, or -1. The command must
- * start the line or follow a space, so text such as "km/b 5" is no command;
- * typing before a command keeps detecting references normally.
+ * start the line or follow a space or opening punctuation or markup (a
+ * parenthesis, bracket, emphasis mark or quote), so text such as "km/b 5" is
+ * no command; typing before a
+ * command keeps detecting references normally.
  */
 function findCommandStart(line: string, cursorCh: number): number {
   for (
@@ -28,7 +36,7 @@ function findCommandStart(line: string, cursorCh: number): number {
     index !== -1;
     index = index > 0 ? line.lastIndexOf(TRIGGER, index - 1) : -1
   ) {
-    if (index === 0 || /\s/.test(line.charAt(index - 1))) return index;
+    if (index === 0 || BEFORE_COMMAND.test(line.charAt(index - 1))) return index;
   }
 
   return -1;
@@ -165,8 +173,11 @@ export class BibleReferenceSuggester extends EditorSuggest<BibleSuggestion> {
 
     if (commandIndex === -1) return null;
 
-    // Get the text after /b
-    const afterCommand = line.slice(commandIndex + TRIGGER.length);
+    // The command runs to the cursor, plus the rest of a reference being
+    // edited in the middle ("/b John 3:1|6"). Text after it, such as the
+    // closing bracket of "(/b John 3:16)", stays in the note.
+    const end = cursor.ch + (REFERENCE_CONTINUATION.exec(line.slice(cursor.ch))?.[0].length ?? 0);
+    const afterCommand = line.slice(commandIndex + TRIGGER.length, end);
     // Show suggestions if there's any text after "/b "
     if (afterCommand.length > 0) {
       return {
@@ -175,7 +186,7 @@ export class BibleReferenceSuggester extends EditorSuggest<BibleSuggestion> {
           line: cursor.line,
         },
         end: {
-          ch: line.length,
+          ch: end,
           line: cursor.line,
         },
         query: afterCommand.trim(), // Trim to handle the space case
@@ -208,9 +219,7 @@ export class BibleReferenceSuggester extends EditorSuggest<BibleSuggestion> {
       ];
     }
 
-    // Silent mode: only what onTrigger detects, to avoid false positives: the
-    // generic "chapter:verse" regex, or the book names of the language, which
-    // also cover single-chapter books written without a colon ("Jude 3")
+    // Silent mode: use generic regex to avoid false positives
     if (
       !isExplicitMode &&
       !query.match(BIBLE_REFERENCE_REGEX) &&
@@ -226,7 +235,8 @@ export class BibleReferenceSuggester extends EditorSuggest<BibleSuggestion> {
     try {
       reference = parseBibleReference(query, this.plugin.settings.language);
     } catch (error: unknown) {
-      logger.error(error instanceof Error ? error.message : String(error));
+      // Expected while the reference is still being typed ("/b J", "/b Jo")
+      logger.debug(error instanceof Error ? error.message : String(error));
 
       if (!isExplicitMode) return [];
 
@@ -302,8 +312,13 @@ export class BibleReferenceSuggester extends EditorSuggest<BibleSuggestion> {
       return;
     }
 
+    // The link ends with the space after it (`suffixOutsideLink`). Before closing markup or a
+    // space, as in "(/b John 3:16)", that space would only be in the way.
+    const next = editor.getLine(context.end.line).charAt(context.end.ch);
+    const linkText = CLOSING_OR_SPACE.test(next) ? convertedLink.trimEnd() : convertedLink;
+
     // Replace the entire command and reference with the converted link
-    editor.replaceRange(convertedLink, context.start, context.end);
+    editor.replaceRange(linkText, context.start, context.end);
 
     // Force close the suggestion box to prevent it from staying open with italic formatting
     this.selecting = true;
